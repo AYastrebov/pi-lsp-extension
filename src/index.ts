@@ -218,7 +218,6 @@ export default function lspExtension(pi: ExtensionAPI) {
       manager = new LspManager(process.cwd(), undefined, makeCallbacks(), undefined, pendingProvider ?? undefined);
       fileSync = new FileSync(manager);
       fileSync.setSyntheticDotChecker((uri) => syntheticDotLocks.has(uri));
-      { const sync = fileSync; manager.setDocumentOpener((path, client) => sync.ensureOpen(path, client)); }
       treeSitter = new TreeSitterManager();
       workspaceIndex = new WorkspaceIndex(process.cwd(), treeSitter);
       fileSync.setTreeSitter(treeSitter, workspaceIndex);
@@ -261,7 +260,6 @@ export default function lspExtension(pi: ExtensionAPI) {
     manager = new LspManager(ctx.cwd, undefined, makeCallbacks(), undefined, pendingProvider ?? undefined);
     fileSync = new FileSync(manager);
     fileSync.setSyntheticDotChecker((uri) => syntheticDotLocks.has(uri));
-      { const sync = fileSync; manager.setDocumentOpener((path, client) => sync.ensureOpen(path, client)); }
     treeSitter = new TreeSitterManager();
     workspaceIndex = new WorkspaceIndex(ctx.cwd, treeSitter);
     fileSync.setTreeSitter(treeSitter, workspaceIndex);

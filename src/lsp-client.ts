@@ -90,6 +90,16 @@ export class LspClient {
     return this._diagnostics.get(uri) ?? [];
   }
 
+  /** Forget cached diagnostics for a URI, e.g. before (re)opening it, so a stale report is not reused. */
+  clearDiagnostics(uri: string): void {
+    this._diagnostics.delete(uri);
+  }
+
+  /** Whether the server advertises pull diagnostics (LSP 3.17 textDocument/diagnostic). */
+  get supportsPullDiagnostics(): boolean {
+    return !!this._serverCapabilities?.diagnosticProvider;
+  }
+
   /** Whether the server has reported diagnostics for a URI (an empty report counts) */
   hasDiagnostics(uri: string): boolean {
     return this._diagnostics.has(uri);
@@ -99,8 +109,9 @@ export class LspClient {
    * Wait until the server publishes diagnostics for a URI, or the timeout passes.
    * Resolves true if a report arrived (or was already cached).
    */
-  waitForDiagnostics(uri: string, timeoutMs: number): Promise<boolean> {
+  waitForDiagnostics(uri: string, timeoutMs: number, signal?: AbortSignal): Promise<boolean> {
     if (this._diagnostics.has(uri)) return Promise.resolve(true);
+    if (signal?.aborted) return Promise.resolve(false);
     return new Promise((resolve) => {
       let done = false;
       const finish = (received: boolean) => {
@@ -119,6 +130,7 @@ export class LspClient {
         finish(false);
       }, timeoutMs);
       const onReport = () => finish(true);
+      signal?.addEventListener("abort", () => finish(false), { once: true });
       const list = this._diagnosticWaiters.get(uri) ?? [];
       list.push(onReport);
       this._diagnosticWaiters.set(uri, list);
@@ -126,23 +138,41 @@ export class LspClient {
   }
 
   /**
-   * Pull diagnostics (LSP 3.17 textDocument/diagnostic) when the server supports it.
-   * Returns null when unsupported or the request fails, so callers fall back to push.
-   * A full report also refreshes the push cache.
+   * Pull diagnostics (LSP 3.17 textDocument/diagnostic).
+   * Returns null when unsupported, on error (e.g. ServerCancelled while indexing), on timeout, or
+   * when `signal` aborts. A full report also refreshes the push cache.
    */
-  async pullDiagnostics(uri: string): Promise<Diagnostic[] | null> {
-    if (!this._serverCapabilities?.diagnosticProvider || !this.connection) return null;
-    try {
-      const report = await this.connection.sendRequest("textDocument/diagnostic", { textDocument: { uri } }) as
-        { kind: "full"; items: Diagnostic[] } | { kind: "unchanged" } | null;
-      if (!report) return null;
-      if (report.kind === "full") {
-        this._diagnostics.set(uri, report.items);
-        return report.items;
+  async pullDiagnostics(uri: string, timeoutMs: number, signal?: AbortSignal): Promise<Diagnostic[] | null> {
+    if (!this.supportsPullDiagnostics || !this.connection) return null;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let onAbort: (() => void) | undefined;
+    const giveUp = new Promise<null>((resolve) => {
+      timer = setTimeout(() => resolve(null), timeoutMs);
+      if (signal) {
+        if (signal.aborted) resolve(null);
+        onAbort = () => resolve(null);
+        signal.addEventListener("abort", onAbort, { once: true });
       }
-      return this._diagnostics.get(uri) ?? [];
-    } catch {
-      return null;
+    });
+    const request = (async () => {
+      try {
+        const report = await this.connection!.sendRequest("textDocument/diagnostic", { textDocument: { uri } }) as
+          { kind: "full"; items: Diagnostic[] } | { kind: "unchanged" } | null;
+        if (!report) return null;
+        if (report.kind === "full") {
+          this._diagnostics.set(uri, report.items);
+          return report.items;
+        }
+        return this._diagnostics.get(uri) ?? [];
+      } catch {
+        return null;
+      }
+    })();
+    try {
+      return await Promise.race([request, giveUp]);
+    } finally {
+      clearTimeout(timer);
+      if (signal && onAbort) signal.removeEventListener("abort", onAbort);
     }
   }
 

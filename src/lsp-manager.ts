@@ -110,11 +110,12 @@ const TS_LANGUAGE_IDS = ["typescript", "javascript", "typescriptreact", "javascr
  */
 export function nativeTypeScriptServers(rootDir: string): Record<string, ServerConfig> {
   const pkg = join(rootDir, "node_modules", "typescript");
-  const tsc = join(rootDir, "node_modules", ".bin", "tsc");
-  if (!existsSync(join(pkg, "package.json")) || existsSync(join(pkg, "lib", "tsserver.js")) || !existsSync(tsc)) {
+  const bin = join(pkg, "bin", "tsc");
+  if (!existsSync(join(pkg, "package.json")) || existsSync(join(pkg, "lib", "tsserver.js")) || !existsSync(bin)) {
     return {};
   }
-  const config: ServerConfig = { command: tsc, args: ["--lsp", "--stdio"] };
+  // bin/tsc is a Node script; run it with node so this also works on Windows (no .cmd shim needed).
+  const config: ServerConfig = { command: process.execPath, args: [bin, "--lsp", "--stdio"] };
   return Object.fromEntries(TS_LANGUAGE_IDS.map((id) => [id, config]));
 }
 
@@ -369,6 +370,16 @@ export class LspManager {
   async openDocument(filePath: string, client: LspClient): Promise<boolean> {
     if (!this.documentOpener) return false;
     return this.documentOpener(this.resolvePath(filePath), client).catch(() => false);
+  }
+
+  /**
+   * Get the client for a file (starting the server if needed) with the document open on it.
+   * Tools use this so servers that only analyze opened documents can answer.
+   */
+  async getReadyClientForFile(filePath: string): Promise<LspClient | null> {
+    const client = await this.getClientForFile(filePath).catch(() => null);
+    if (client) await this.openDocument(filePath, client);
+    return client;
   }
 
   /** Get a file URI from a path */

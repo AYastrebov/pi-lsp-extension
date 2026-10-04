@@ -75,7 +75,7 @@ export function createDiagnosticsTool(
     ],
     parameters: DiagnosticsParams,
 
-    async execute(_toolCallId, params) {
+    async execute(_toolCallId, params, signal) {
       const filePath = params.path.replace(/^@/, "");
 
       // Workspace-wide mode
@@ -90,15 +90,30 @@ export function createDiagnosticsTool(
         const uri = manager.getFileUri(filePath);
         const opened = await manager.openDocument(filePath, client);
 
-        // Prefer pull diagnostics (LSP 3.17); otherwise wait for the first push for this file.
-        let diagnostics = await client.pullDiagnostics(uri);
-        if (diagnostics === null) {
-          if (opened || !client.hasDiagnostics(uri)) {
-            await client.waitForDiagnostics(uri, DIAGNOSTICS_WAIT_MS);
+        let diagnostics: Diagnostic[];
+        if (client.supportsPullDiagnostics) {
+          // Pull servers answer on request; retry once (ServerCancelled/ContentModified while indexing).
+          let pulled = await client.pullDiagnostics(uri, DIAGNOSTICS_WAIT_MS, signal);
+          if (pulled === null && !signal?.aborted) {
+            await new Promise((r) => setTimeout(r, 500));
+            pulled = await client.pullDiagnostics(uri, DIAGNOSTICS_WAIT_MS, signal);
           }
+          if (pulled === null) {
+            return {
+              content: [{ type: "text", text: "The server did not answer the diagnostics request (it may still be indexing). Retry shortly; this is not a clean result." }],
+              details: { count: 0 },
+            };
+          }
+          diagnostics = pulled;
+        } else {
+          // Push servers: after opening, wait for the first report. An already-open document with no
+          // report means the server has nothing to say about it (some servers only publish problems).
+          if (opened) await client.waitForDiagnostics(uri, DIAGNOSTICS_WAIT_MS, signal);
           if (!client.hasDiagnostics(uri)) {
             return {
-              content: [{ type: "text", text: "No diagnostics received yet for this file — the server may still be analyzing it. Retry shortly; this is not a clean result." }],
+              content: [{ type: "text", text: opened
+                ? "No diagnostics received yet for this file — the server may still be analyzing it. Retry shortly; this is not a clean result."
+                : "The server has not reported diagnostics for this file." }],
               details: { count: 0 },
             };
           }

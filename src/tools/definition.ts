@@ -63,8 +63,7 @@ export function createDefinitionTool(
         return { content: [{ type: "text", text: "Either line/character or query is required." }], details: { count: 0 } };
       }
 
-      const client = await manager.getClientForFile(filePath).catch(() => null);
-      if (client) await manager.openDocument(filePath, client);
+      const client = await manager.getReadyClientForFile(filePath);
 
       if (client) {
         // LSP path
