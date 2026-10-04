@@ -9,6 +9,7 @@
  * prevent unbounded memory growth in the LSP server during long sessions.
  */
 
+import type { LspClient } from "./lsp-client.js";
 import { readFile } from "node:fs/promises";
 import { LspManager } from "./lsp-manager.js";
 import type { TreeSitterManager } from "./tree-sitter/parser-manager.js";
@@ -105,6 +106,34 @@ export class FileSync {
       this.touchAndEvict(uri);
     } catch {
       // File might not exist or be unreadable — ignore
+    }
+  }
+
+  /**
+   * Make sure a document is open on the given client before a request about it.
+   * Servers such as typescript-language-server and kotlin-lsp only analyze opened
+   * documents, so tools must open the file themselves when pi has not synced it yet
+   * (handleFileRead skips files read before the server was running).
+   * Returns true if this call opened the document.
+   */
+  async ensureOpen(filePath: string, client: LspClient): Promise<boolean> {
+    const absPath = this.manager.resolvePath(filePath);
+    const uri = this.manager.getFileUri(absPath);
+    if (this.tracked.has(uri)) {
+      this.touchAndEvict(uri);
+      return false;
+    }
+    const languageId = this.manager.getLanguageId(absPath);
+    if (!languageId) return false;
+    try {
+      const content = await readFile(absPath, "utf-8");
+      const doc: TrackedDocument = { uri, languageId, version: 1 };
+      this.tracked.set(uri, doc);
+      client.didOpen(uri, languageId, doc.version, content);
+      this.touchAndEvict(uri);
+      return true;
+    } catch {
+      return false;
     }
   }
 

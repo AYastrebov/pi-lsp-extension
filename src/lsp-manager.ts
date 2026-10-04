@@ -101,6 +101,23 @@ export interface ServerStatus {
   shared: boolean;
 }
 
+const TS_LANGUAGE_IDS = ["typescript", "javascript", "typescriptreact", "javascriptreact"];
+
+/**
+ * TypeScript 7 (the native port) ships no lib/tsserver.js, so typescript-language-server cannot
+ * attach; it has its own `tsc --lsp --stdio`. When the project's typescript is such a build, use the
+ * project's tsc for TS/JS files. Custom configs (.pi-lsp.json) still win.
+ */
+export function nativeTypeScriptServers(rootDir: string): Record<string, ServerConfig> {
+  const pkg = join(rootDir, "node_modules", "typescript");
+  const tsc = join(rootDir, "node_modules", ".bin", "tsc");
+  if (!existsSync(join(pkg, "package.json")) || existsSync(join(pkg, "lib", "tsserver.js")) || !existsSync(tsc)) {
+    return {};
+  }
+  const config: ServerConfig = { command: tsc, args: ["--lsp", "--stdio"] };
+  return Object.fromEntries(TS_LANGUAGE_IDS.map((id) => [id, config]));
+}
+
 export class LspManager {
   private clients: Map<string, LspClient> = new Map();
   private serverConfigs: Map<string, ServerConfig>;
@@ -124,6 +141,7 @@ export class LspManager {
     this.rootDir = resolve(rootDir);
     this.serverConfigs = new Map(Object.entries({
       ...DEFAULT_SERVERS,
+      ...nativeTypeScriptServers(this.rootDir),
       ...customConfigs,
     }));
     this._workspace = workspace ?? new DefaultWorkspaceProvider();
@@ -338,6 +356,19 @@ export class LspManager {
   /** Resolve a file path to a language ID */
   getLanguageId(filePath: string): string | undefined {
     return getLanguageIdFromPath(filePath);
+  }
+
+  private documentOpener: ((filePath: string, client: LspClient) => Promise<boolean>) | null = null;
+
+  /** Register how documents are opened (FileSync owns document versions). */
+  setDocumentOpener(opener: ((filePath: string, client: LspClient) => Promise<boolean>) | null): void {
+    this.documentOpener = opener;
+  }
+
+  /** Open a document on the client if it is not open yet. Returns true if it was opened now. */
+  async openDocument(filePath: string, client: LspClient): Promise<boolean> {
+    if (!this.documentOpener) return false;
+    return this.documentOpener(this.resolvePath(filePath), client).catch(() => false);
   }
 
   /** Get a file URI from a path */

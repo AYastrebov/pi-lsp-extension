@@ -75,6 +75,7 @@ export function createHoverTool(
       }
 
       const client = await manager.getClientForFile(filePath).catch(() => null);
+      if (client) await manager.openDocument(filePath, client);
 
       if (client) {
         // LSP path

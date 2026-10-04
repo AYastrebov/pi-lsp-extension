@@ -38,6 +38,7 @@ var LspClient = class {
   connection = null;
   _serverCapabilities = null;
   _diagnostics = /* @__PURE__ */ new Map();
+  _diagnosticWaiters = /* @__PURE__ */ new Map();
   _initialized = false;
   _disposed = false;
   /** True if connected to a daemon socket (server init handled by daemon) */
@@ -57,6 +58,58 @@ var LspClient = class {
   /** Get cached diagnostics for a URI */
   getDiagnostics(uri) {
     return this._diagnostics.get(uri) ?? [];
+  }
+  /** Whether the server has reported diagnostics for a URI (an empty report counts) */
+  hasDiagnostics(uri) {
+    return this._diagnostics.has(uri);
+  }
+  /**
+   * Wait until the server publishes diagnostics for a URI, or the timeout passes.
+   * Resolves true if a report arrived (or was already cached).
+   */
+  waitForDiagnostics(uri, timeoutMs) {
+    if (this._diagnostics.has(uri)) return Promise.resolve(true);
+    return new Promise((resolve6) => {
+      let done = false;
+      const finish = (received) => {
+        if (done) return;
+        done = true;
+        clearTimeout(timer);
+        resolve6(received);
+      };
+      const timer = setTimeout(() => {
+        const list2 = this._diagnosticWaiters.get(uri);
+        if (list2) {
+          const rest = list2.filter((w) => w !== onReport);
+          if (rest.length > 0) this._diagnosticWaiters.set(uri, rest);
+          else this._diagnosticWaiters.delete(uri);
+        }
+        finish(false);
+      }, timeoutMs);
+      const onReport = () => finish(true);
+      const list = this._diagnosticWaiters.get(uri) ?? [];
+      list.push(onReport);
+      this._diagnosticWaiters.set(uri, list);
+    });
+  }
+  /**
+   * Pull diagnostics (LSP 3.17 textDocument/diagnostic) when the server supports it.
+   * Returns null when unsupported or the request fails, so callers fall back to push.
+   * A full report also refreshes the push cache.
+   */
+  async pullDiagnostics(uri) {
+    if (!this._serverCapabilities?.diagnosticProvider || !this.connection) return null;
+    try {
+      const report = await this.connection.sendRequest("textDocument/diagnostic", { textDocument: { uri } });
+      if (!report) return null;
+      if (report.kind === "full") {
+        this._diagnostics.set(uri, report.items);
+        return report.items;
+      }
+      return this._diagnostics.get(uri) ?? [];
+    } catch {
+      return null;
+    }
   }
   /** Get all cached diagnostics */
   getAllDiagnostics() {
@@ -78,6 +131,11 @@ var LspClient = class {
       "textDocument/publishDiagnostics",
       (params) => {
         this._diagnostics.set(params.uri, params.diagnostics);
+        const waiters = this._diagnosticWaiters.get(params.uri);
+        if (waiters) {
+          this._diagnosticWaiters.delete(params.uri);
+          for (const resolve6 of waiters) resolve6();
+        }
       }
     );
     this.connection.onRequest(
@@ -442,6 +500,16 @@ var DEFAULT_SERVERS = {
   go: { command: "gopls", args: ["serve"] },
   java: { command: "jdtls", args: [] }
 };
+var TS_LANGUAGE_IDS = ["typescript", "javascript", "typescriptreact", "javascriptreact"];
+function nativeTypeScriptServers(rootDir) {
+  const pkg = join(rootDir, "node_modules", "typescript");
+  const tsc = join(rootDir, "node_modules", ".bin", "tsc");
+  if (!existsSync(join(pkg, "package.json")) || existsSync(join(pkg, "lib", "tsserver.js")) || !existsSync(tsc)) {
+    return {};
+  }
+  const config = { command: tsc, args: ["--lsp", "--stdio"] };
+  return Object.fromEntries(TS_LANGUAGE_IDS.map((id) => [id, config]));
+}
 var LspManager = class _LspManager {
   clients = /* @__PURE__ */ new Map();
   serverConfigs;
@@ -463,6 +531,7 @@ var LspManager = class _LspManager {
     this.rootDir = resolve(rootDir);
     this.serverConfigs = new Map(Object.entries({
       ...DEFAULT_SERVERS,
+      ...nativeTypeScriptServers(this.rootDir),
       ...customConfigs
     }));
     this._workspace = workspace ?? new DefaultWorkspaceProvider();
@@ -653,6 +722,16 @@ var LspManager = class _LspManager {
   /** Resolve a file path to a language ID */
   getLanguageId(filePath) {
     return getLanguageIdFromPath(filePath);
+  }
+  documentOpener = null;
+  /** Register how documents are opened (FileSync owns document versions). */
+  setDocumentOpener(opener) {
+    this.documentOpener = opener;
+  }
+  /** Open a document on the client if it is not open yet. Returns true if it was opened now. */
+  async openDocument(filePath, client) {
+    if (!this.documentOpener) return false;
+    return this.documentOpener(this.resolvePath(filePath), client).catch(() => false);
   }
   /** Get a file URI from a path */
   getFileUri(filePath) {
@@ -1145,6 +1224,33 @@ var FileSync = class {
       client.didOpen(uri, languageId, doc.version, content);
       this.touchAndEvict(uri);
     } catch {
+    }
+  }
+  /**
+   * Make sure a document is open on the given client before a request about it.
+   * Servers such as typescript-language-server and kotlin-lsp only analyze opened
+   * documents, so tools must open the file themselves when pi has not synced it yet
+   * (handleFileRead skips files read before the server was running).
+   * Returns true if this call opened the document.
+   */
+  async ensureOpen(filePath, client) {
+    const absPath = this.manager.resolvePath(filePath);
+    const uri = this.manager.getFileUri(absPath);
+    if (this.tracked.has(uri)) {
+      this.touchAndEvict(uri);
+      return false;
+    }
+    const languageId = this.manager.getLanguageId(absPath);
+    if (!languageId) return false;
+    try {
+      const content = await readFile(absPath, "utf-8");
+      const doc = { uri, languageId, version: 1 };
+      this.tracked.set(uri, doc);
+      client.didOpen(uri, languageId, doc.version, content);
+      this.touchAndEvict(uri);
+      return true;
+    } catch {
+      return false;
     }
   }
   /**
@@ -1948,6 +2054,13 @@ function severityToString(severity) {
       return "unknown";
   }
 }
+function startingHint(manager, filePath) {
+  const languageId = manager.getLanguageId(filePath);
+  if (languageId && manager.isServerStarting(languageId)) {
+    return ` \u2014 the ${languageId} LSP server is starting; retry for type errors`;
+  }
+  return "";
+}
 function formatDiagnostic(diag, filePath) {
   const line = diag.range.start.line + 1;
   const col = diag.range.start.character + 1;
@@ -1956,6 +2069,7 @@ function formatDiagnostic(diag, filePath) {
   const code = diag.code !== void 0 ? ` (${diag.code})` : "";
   return `${filePath}:${line}:${col} ${sev}: ${diag.message}${code}${source}`;
 }
+var DIAGNOSTICS_WAIT_MS = 8e3;
 var DiagnosticsParams = Type.Object({
   path: Type.String({ description: 'File path to get diagnostics for. Pass "*" to get all workspace diagnostics from all running LSP servers.' })
 });
@@ -1978,7 +2092,20 @@ function createDiagnosticsTool(manager, treeSitter) {
       const client = await manager.getClientForFile(filePath).catch(() => null);
       if (client) {
         const uri = manager.getFileUri(filePath);
-        const diagnostics = client.getDiagnostics(uri);
+        const opened = await manager.openDocument(filePath, client);
+        let diagnostics = await client.pullDiagnostics(uri);
+        if (diagnostics === null) {
+          if (opened || !client.hasDiagnostics(uri)) {
+            await client.waitForDiagnostics(uri, DIAGNOSTICS_WAIT_MS);
+          }
+          if (!client.hasDiagnostics(uri)) {
+            return {
+              content: [{ type: "text", text: "No diagnostics received yet for this file \u2014 the server may still be analyzing it. Retry shortly; this is not a clean result." }],
+              details: { count: 0 }
+            };
+          }
+          diagnostics = client.getDiagnostics(uri);
+        }
         if (diagnostics.length === 0) {
           return { content: [{ type: "text", text: "No diagnostics (clean)." }], details: { count: 0 } };
         }
@@ -2018,7 +2145,7 @@ ${truncation.content}`;
             if (tree) {
               const syntaxErrors = getSyntaxErrors(tree);
               if (syntaxErrors.length === 0) {
-                return { content: [{ type: "text", text: "No syntax errors detected. [tree-sitter \u2014 syntax only, no type checking]" }], details: { count: 0 } };
+                return { content: [{ type: "text", text: `No syntax errors detected. [tree-sitter \u2014 syntax only, no type checking]${startingHint(manager, filePath)}` }], details: { count: 0 } };
               }
               const relPath = relative(manager.resolvePath("."), absPath);
               const lines = syntaxErrors.map(
@@ -2026,7 +2153,7 @@ ${truncation.content}`;
               );
               const output = lines.join("\n");
               const truncation = truncateHead(output, { maxLines: DEFAULT_MAX_LINES, maxBytes: DEFAULT_MAX_BYTES });
-              let resultText = `${syntaxErrors.length} syntax error(s) [tree-sitter \u2014 syntax only, no type checking]
+              let resultText = `${syntaxErrors.length} syntax error(s) [tree-sitter \u2014 syntax only, no type checking]${startingHint(manager, filePath)}
 
 ${truncation.content}`;
               if (truncation.truncated) {
@@ -2369,6 +2496,7 @@ Available symbols: ${names.slice(0, 20).join(", ")}` : "";
         return { content: [{ type: "text", text: "Either line/character or query is required." }], details: { hasResult: false } };
       }
       const client = await manager.getClientForFile(filePath).catch(() => null);
+      if (client) await manager.openDocument(filePath, client);
       if (client) {
         const uri = manager.getFileUri(filePath);
         const position = { line: line - 1, character: character - 1 };
@@ -2512,6 +2640,7 @@ Available symbols: ${names.slice(0, 20).join(", ")}` : "";
         return { content: [{ type: "text", text: "Either line/character or query is required." }], details: { count: 0 } };
       }
       const client = await manager.getClientForFile(filePath).catch(() => null);
+      if (client) await manager.openDocument(filePath, client);
       if (client) {
         const uri = manager.getFileUri(filePath);
         const position = { line: line - 1, character: character - 1 };
@@ -2668,6 +2797,7 @@ Available symbols: ${names.slice(0, 20).join(", ")}` : "";
         return { content: [{ type: "text", text: "Either line/character or query is required." }], details: { count: 0 } };
       }
       const client = await manager.getClientForFile(filePath).catch(() => null);
+      if (client) await manager.openDocument(filePath, client);
       if (!client) {
         return { content: [{ type: "text", text: manager.getUnavailableReason(filePath) }], details: { count: 0 } };
       }
@@ -2818,6 +2948,7 @@ function createSymbolsTool(manager, treeSitter, workspaceIndex) {
       }
       if (filePath) {
         const client = await manager.getClientForFile(filePath).catch(() => null);
+        if (client) await manager.openDocument(filePath, client);
         if (client) {
           const uri = manager.getFileUri(filePath);
           try {
@@ -3035,6 +3166,7 @@ Available symbols: ${names.slice(0, 20).join(", ")}` : "";
         return { content: [{ type: "text", text: "Either line/character or query is required." }], details: { fileCount: 0, editCount: 0 } };
       }
       const client = await manager.getClientForFile(filePath).catch(() => null);
+      if (client) await manager.openDocument(filePath, client);
       if (!client) {
         return { content: [{ type: "text", text: manager.getUnavailableReason(filePath) }], details: { fileCount: 0, editCount: 0 } };
       }
@@ -3417,6 +3549,7 @@ function createCompletionsTool(manager, versionTracker, treeSitter) {
         return { content: [{ type: "text", text: "Either line/character or query is required." }], details: { count: 0, total: 0 } };
       }
       const client = await manager.getClientForFile(filePath).catch(() => null);
+      if (client) await manager.openDocument(filePath, client);
       if (!client) {
         return {
           content: [
@@ -4360,6 +4493,7 @@ Available symbols: ${names.slice(0, 20).join(", ")}` : "";
         return { content: [{ type: "text", text: "Either line/character or query is required." }], details: { count: 0, preferredCount: 0 } };
       }
       const client = await manager.getClientForFile(filePath).catch(() => null);
+      if (client) await manager.openDocument(filePath, client);
       if (!client) {
         return { content: [{ type: "text", text: manager.getUnavailableReason(filePath) }], details: { count: 0, preferredCount: 0 } };
       }
@@ -4586,6 +4720,10 @@ function lspExtension(pi) {
       manager = new LspManager(process.cwd(), void 0, makeCallbacks(), void 0, pendingProvider ?? void 0);
       fileSync = new FileSync(manager);
       fileSync.setSyntheticDotChecker((uri) => syntheticDotLocks.has(uri));
+      {
+        const sync = fileSync;
+        manager.setDocumentOpener((path, client) => sync.ensureOpen(path, client));
+      }
       treeSitter = new TreeSitterManager();
       workspaceIndex = new WorkspaceIndex(process.cwd(), treeSitter);
       fileSync.setTreeSitter(treeSitter, workspaceIndex);
@@ -4620,6 +4758,10 @@ function lspExtension(pi) {
     manager = new LspManager(ctx.cwd, void 0, makeCallbacks(), void 0, pendingProvider ?? void 0);
     fileSync = new FileSync(manager);
     fileSync.setSyntheticDotChecker((uri) => syntheticDotLocks.has(uri));
+    {
+      const sync = fileSync;
+      manager.setDocumentOpener((path, client) => sync.ensureOpen(path, client));
+    }
     treeSitter = new TreeSitterManager();
     workspaceIndex = new WorkspaceIndex(ctx.cwd, treeSitter);
     fileSync.setTreeSitter(treeSitter, workspaceIndex);

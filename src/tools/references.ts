@@ -60,6 +60,7 @@ export function createReferencesTool(
       }
 
       const client = await manager.getClientForFile(filePath).catch(() => null);
+      if (client) await manager.openDocument(filePath, client);
       if (!client) {
         return { content: [{ type: "text", text: manager.getUnavailableReason(filePath) }], details: { count: 0 } };
       }

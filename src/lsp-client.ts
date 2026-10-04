@@ -57,6 +57,7 @@ export class LspClient {
   private connection: MessageConnection | null = null;
   private _serverCapabilities: ServerCapabilities | null = null;
   private _diagnostics: Map<string, Diagnostic[]> = new Map();
+  private _diagnosticWaiters: Map<string, Array<() => void>> = new Map();
   private _initialized = false;
   private _disposed = false;
   /** True if connected to a daemon socket (server init handled by daemon) */
@@ -89,6 +90,62 @@ export class LspClient {
     return this._diagnostics.get(uri) ?? [];
   }
 
+  /** Whether the server has reported diagnostics for a URI (an empty report counts) */
+  hasDiagnostics(uri: string): boolean {
+    return this._diagnostics.has(uri);
+  }
+
+  /**
+   * Wait until the server publishes diagnostics for a URI, or the timeout passes.
+   * Resolves true if a report arrived (or was already cached).
+   */
+  waitForDiagnostics(uri: string, timeoutMs: number): Promise<boolean> {
+    if (this._diagnostics.has(uri)) return Promise.resolve(true);
+    return new Promise((resolve) => {
+      let done = false;
+      const finish = (received: boolean) => {
+        if (done) return;
+        done = true;
+        clearTimeout(timer);
+        resolve(received);
+      };
+      const timer = setTimeout(() => {
+        const list = this._diagnosticWaiters.get(uri);
+        if (list) {
+          const rest = list.filter((w) => w !== onReport);
+          if (rest.length > 0) this._diagnosticWaiters.set(uri, rest);
+          else this._diagnosticWaiters.delete(uri);
+        }
+        finish(false);
+      }, timeoutMs);
+      const onReport = () => finish(true);
+      const list = this._diagnosticWaiters.get(uri) ?? [];
+      list.push(onReport);
+      this._diagnosticWaiters.set(uri, list);
+    });
+  }
+
+  /**
+   * Pull diagnostics (LSP 3.17 textDocument/diagnostic) when the server supports it.
+   * Returns null when unsupported or the request fails, so callers fall back to push.
+   * A full report also refreshes the push cache.
+   */
+  async pullDiagnostics(uri: string): Promise<Diagnostic[] | null> {
+    if (!this._serverCapabilities?.diagnosticProvider || !this.connection) return null;
+    try {
+      const report = await this.connection.sendRequest("textDocument/diagnostic", { textDocument: { uri } }) as
+        { kind: "full"; items: Diagnostic[] } | { kind: "unchanged" } | null;
+      if (!report) return null;
+      if (report.kind === "full") {
+        this._diagnostics.set(uri, report.items);
+        return report.items;
+      }
+      return this._diagnostics.get(uri) ?? [];
+    } catch {
+      return null;
+    }
+  }
+
   /** Get all cached diagnostics */
   getAllDiagnostics(): Map<string, Diagnostic[]> {
     return new Map(this._diagnostics);
@@ -114,6 +171,11 @@ export class LspClient {
       "textDocument/publishDiagnostics",
       (params: PublishDiagnosticsParams) => {
         this._diagnostics.set(params.uri, params.diagnostics);
+        const waiters = this._diagnosticWaiters.get(params.uri);
+        if (waiters) {
+          this._diagnosticWaiters.delete(params.uri);
+          for (const resolve of waiters) resolve();
+        }
       }
     );
 

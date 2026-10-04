@@ -1,5 +1,24 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- `lsp_diagnostics` reported "No diagnostics (clean)." for files with errors on servers that only
+  analyze opened documents (typescript-language-server, kotlin-lsp). No tool opened the document
+  itself, and files `read` before the server was running were never synced. Every LSP tool now opens
+  the file first (`FileSync.ensureOpen` via `LspManager.openDocument`), and `lsp_diagnostics` uses
+  pull diagnostics (`textDocument/diagnostic`) when the server offers them, otherwise waits up to 8 s
+  for the first pushed report. When none arrives it says so instead of claiming the file is clean.
+- The tree-sitter fallback now says when the real server is still starting, so a syntax-only answer
+  is not mistaken for a clean type check.
+
+### Added
+
+- TypeScript 7 (native port) projects: when `node_modules/typescript` has no `lib/tsserver.js`, the
+  project's own `tsc --lsp --stdio` serves TS/JS files (typescript-language-server cannot attach to
+  TS 7). `.pi-lsp.json` still overrides it.
+
 ## 1.4.0
 
 1.3.0 is the latest release on npm. This release also ships the fix for #13, which was merged on GitHub after 1.3.0 but never released.
